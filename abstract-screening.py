@@ -7,6 +7,7 @@ import json
 import os
 import argparse
 import csv
+import time
 import urllib.request
 import urllib.error
 
@@ -89,34 +90,37 @@ LLM_PROVIDER_SETTINGS = {
 LLM_PROMPT = """You are a scientific abstract screening assistant for a climate neutrality review.
 
 Your task: Answer exactly 4 questions about each abstract using ONLY the information provided.
-Return a JSON object with 8 fields (4 questions + 4 comments).
+Return a valid JSON object with 8 fields (4 questions + 4 comments). No markdown, no extra text.
 
 CRITICAL RULES:
 1. Base decisions ONLY on the abstract text. Use NO external knowledge.
 2. Each paper is independent. Do NOT cross-reference with other papers.
 3. For each question, respond with EXACTLY one of: "yes", "no", "unclear"
-4. Comments are ONLY required if your answer is "unclear" (otherwise leave empty).
+4. Only add comments if your answer is "unclear" (otherwise leave empty).
 5. Comments must be SHORT (max 1-2 sentences explaining why uncertain).
+6. Stick the information of the csv file, do not make assumptions based on the doi or other metadata.
 
 QUESTION DEFINITIONS:
 
 Q1 (Climate Neutrality):
-  - Does the abstract describe a pathway or system configuration that IS climate-neutral?
+  - Does the abstract provide a pathway or a system configuration which IS climate-neutral?
+  - We also accept "net zero", "carbon neutral(ity)", "zero emissions/carbon", "deep decarbonization" and similar
   - Merely mentioning "net zero" is NOT sufficient. It must be actually assessed/modeled.
   - Answer: "yes" if pathway/config is climate-neutral | "no" if not | "unclear" if ambiguous
 
 Q2 (Region):
-  - Does the abstract target at least ONE specific geographic region?
+  - Does the abstract target at least ONE specific spatial area?
+  - OK: (group of) country, city, state, province, district
   - "Global" or "worldwide" analysis alone = "no"
   - Answer: "yes" if specific region(s) mentioned | "no" if global-only | "unclear" if ambiguous
 
 Q3 (Sector):
-  - Does the abstract address at least ONE relevant sector?
-  - Examples: energy, industry, transport, agriculture, waste, etc. (not exhaustive)
+  - Does the abstract target at least ONE of the following sectors:
+  - energy, industry, agriculture, forestry, land use, or AFOLU (agriculture, forestry and other land uses)
   - Answer: "yes" if sector specified | "no" if none mentioned | "unclear" if unclear
 
 Q4 (Method):
-  - Does the abstract include quantitative modelling or scenario analysis?
+  - Does the abstract include quantitative modelling and/or a scenario process to generate climate neutral pathways or systems?
   - Qualitative discussion alone = "no"
   - Answer: "yes" if quantitative/modeling present | "no" if not | "unclear" if unclear
 
@@ -195,34 +199,23 @@ def normalize_result(raw_result: Dict[str, str]) -> Dict[str, str]:
 class LLMApiClient:
     """
     Low-level HTTP client for communicating with OpenAI-compatible LLM endpoints.
-
-    DESIGN:
-      - Uses urllib (no external dependencies)
-      - Supports any API with POST /chat/completions endpoint
-      - Handles JSON schema enforcement (strict mode)
-      - Basic error handling (HTTP errors, timeouts)
-
-    PROVIDERS TESTED:
-      - OpenAI API (https://api.openai.com/v1)
-      - OpenRouter (https://openrouter.ai/api/v1)
-      - Groq (https://api.groq.com/openai/v1)
-      - Together AI (https://api.together.xyz/v1)
-
-    RISK: Rate limits, quota exceeded, invalid API keys → caught as exceptions
     """
-
-    def __init__(self, api_key: str, base_url: str, timeout: int = 60) -> None:
-        """
-        Initialize the API client.
-
-        Args:
-          api_key: Bearer token for API authentication
-          base_url: Base URL of the LLM endpoint (e.g., https://api.openai.com/v1)
-          timeout: HTTP request timeout in seconds (default: 60)
-        """
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        timeout: int = 60,
+        retries: int = 3,
+        retry_delay: float = 1.5,
+    ) -> None:
+        # API-Schlüssel + Endpoint werden zentral am Client gehalten.
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")  # Remove trailing slash
+        self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+
+        # Kleine Retry-Policy für Timeouts, 429 und temporäre Serverfehler.
+        self.retries = retries
+        self.retry_delay = retry_delay
 
     def chat_completions_create(
         self,
@@ -233,32 +226,10 @@ class LLMApiClient:
         messages: list,
     ) -> Dict:
         """
-        Make a single chat completions API call.
-
-        INPUT:
-          model: Model identifier (e.g., "gpt-4o-mini", "groq-mixtral-8x7b")
-          temperature: Sampling temperature (0 = deterministic, 1 = creative)
-          response_format: JSON schema for structured output
-          messages: List of {"role": "user|system", "content": "..."} dicts
-
-        OUTPUT:
-          response: Parsed JSON response from API, e.g.:
-                    {"choices": [{"message": {"content": "{...JSON...}"}}], ...}
-
-        ERROR HANDLING:
-          - HTTP errors (4xx, 5xx) → raise RuntimeError with status + body
-          - Network timeout → propagate URLError
-          - JSON parsing errors → propagate JSONDecodeError
-
-        RISK:
-          - Rate limit (429) → request fails, caught by caller as RuntimeError
-          - Quota exceeded (403) → request fails, caught by caller as RuntimeError
-          - Invalid model name (400) → request fails, caught by caller as RuntimeError
+        Make a single chat completions API call with simple retry logic.
         """
-        # Construct the API endpoint URL
         url = f"{self.base_url}/chat/completions"
 
-        # Build the request payload
         payload = {
             "model": model,
             "temperature": temperature,
@@ -266,25 +237,65 @@ class LLMApiClient:
             "messages": messages,
         }
 
-        # Create HTTP POST request with headers and JSON body
         req = urllib.request.Request(
             url=url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}",
+                # OpenRouter-empfohlene optionale Metadaten-Header
+                "HTTP-Referer": "climate-review-project",
+                "X-Title": "abstract-screening",
             },
             method="POST",
         )
 
-        try:
-            # Send request and parse JSON response
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            # Extract error details from response body
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"LLM HTTP {exc.code}: {body}") from exc
+        last_error: Optional[Exception] = None
+
+        # Mehrfach versuchen, damit kurze Störungen nicht sofort zu "unclear" führen.
+        for attempt in range(1, self.retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                last_error = RuntimeError(f"LLM HTTP {exc.code}: {body}")
+
+                # Nur temporäre HTTP-Fehler erneut versuchen.
+                if attempt < self.retries and _is_retryable_status(exc.code):
+                    time.sleep(self.retry_delay)
+                    continue
+                raise last_error from exc
+
+            except urllib.error.URLError as exc:
+                last_error = RuntimeError(f"LLM network error: {exc}")
+                if attempt < self.retries:
+                    time.sleep(self.retry_delay)
+                    continue
+                raise last_error from exc
+
+            except json.JSONDecodeError as exc:
+                # Falls die Antwort kurzfristig kaputt ist, kann ein Retry helfen.
+                last_error = RuntimeError(f"LLM invalid JSON response: {exc}")
+                if attempt < self.retries:
+                    time.sleep(self.retry_delay)
+                    continue
+                raise last_error from exc
+
+        # Sicherheitsnetz; wird praktisch nur erreicht, wenn alle Versuche scheitern.
+        raise last_error or RuntimeError("LLM request failed")
+
+# ============================================================================
+# RETRY-HELPER
+# ============================================================================
+def _is_retryable_status(status_code: int) -> bool:
+    """
+    Entscheidet, ob ein HTTP-Status ein Retry rechtfertigt.
+    - 408/409/429: Timeout/Konflikt/Rate Limit
+    - 5xx: temporäre Serverfehler
+    """
+    return status_code in {408, 409, 429} or 500 <= status_code < 600
 
 # ============================================================================
 # MAIN SCREENING FUNCTION (Single paper → LLM call → structured JSON)
@@ -293,72 +304,12 @@ class LLMApiClient:
 def call_llm_once(client: LLMApiClient, model: str, abstract: str) -> Dict[str, str]:
     """
     Send one abstract to the LLM and get structured screening results.
-
-    INPUT:
-      client: Initialized LLMApiClient instance
-      model: Model name to use (e.g., "gpt-4o-mini")
-      abstract: The paper's abstract text (string, may be empty)
-
-    PROCESS:
-      1. Prepare messages: system prompt + user abstract
-      2. Call LLM API with JSON schema enforcement (strict mode)
-      3. Extract JSON from response (usually in response.choices[0].message.content)
-      4. Parse JSON to dict
-      5. Normalize result (validate labels, handle errors)
-      6. Return normalized dict with all 8 fields
-
-    OUTPUT:
-      normalized screening result: Dict with keys:
-        - q1_climate_neutrality, q1_comment
-        - q2_region, q2_comment
-        - q3_sector, q3_comment
-        - q4_method, q4_comment
-      All labels are guaranteed to be in {"yes", "no", "unclear"}
-
-    ERROR HANDLING:
-      - API failures caught by caller (in process_csv())
-      - Invalid JSON in response → call normalize_result() which sets to "unclear"
-      - Missing fields → normalize_result() fills with defaults
-
-    REPRODUCIBILITY:
-      - temperature=0 ensures deterministic output
-      - response_format with "strict": True enforces schema compliance
     """
-    # Call the LLM API with structured output mode
     response = client.chat_completions_create(
         model=model,
-        temperature=0,  # Deterministic output for reproducibility
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "screening_output",
-                "strict": True,  # Enforce strict schema compliance
-                "schema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "q1_climate_neutrality": {"type": "string"},
-                        "q1_comment": {"type": "string"},
-                        "q2_region": {"type": "string"},
-                        "q2_comment": {"type": "string"},
-                        "q3_sector": {"type": "string"},
-                        "q3_comment": {"type": "string"},
-                        "q4_method": {"type": "string"},
-                        "q4_comment": {"type": "string"},
-                    },
-                    "required": [
-                        "q1_climate_neutrality",
-                        "q1_comment",
-                        "q2_region",
-                        "q2_comment",
-                        "q3_sector",
-                        "q3_comment",
-                        "q4_method",
-                        "q4_comment",
-                    ],
-                },
-            },
-        },
+        temperature=0,
+        # OpenRouter-kompatibel: kein strict json_schema, nur json_object.
+        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": LLM_PROMPT},
             {"role": "user", "content": f"Abstract:\n{abstract or ''}"},
@@ -373,10 +324,7 @@ def call_llm_once(client: LLMApiClient, model: str, abstract: str) -> Dict[str, 
         .get("content")
     ) or "{}"
 
-    # Parse the JSON string to a Python dict
     parsed = json.loads(content)
-
-    # Validate and normalize the result
     return normalize_result(parsed)
 
 # ============================================================================
@@ -595,61 +543,17 @@ def process_csv(
 def main() -> None:
     """
     Parse command-line arguments and launch the screening pipeline.
-
-    COMMAND-LINE INTERFACE:
-      python abstract-screening.py INPUT.csv OUTPUT.csv [OPTIONS]
-
-    ARGUMENTS:
-      input_csv: Path to input CSV file (required)
-      output_csv: Path to output CSV file (required)
-
-    OPTIONS:
-      --model MODEL: Model identifier (default: "gpt-4o-mini")
-                     Examples: "gpt-4o", "groq-mixtral-8x7b", etc.
-
-      --provider {default, router, speed, cloud}: LLM provider (default: "default")
-                     "router" = OpenRouter
-                     "speed" = Groq
-                     "cloud" = Together AI
-                     "default" = custom endpoint (requires --base-url)
-
-      --api-key KEY: API key (optional, resolves from env if not provided)
-                     Highest priority: CLI > env var
-
-      --base-url URL: Base URL for LLM endpoint (optional)
-                      Examples:
-                        https://api.openai.com/v1
-                        https://openrouter.ai/api/v1
-                        https://api.groq.com/openai/v1
-
-    EXAMPLE USAGE:
-      # Using OpenRouter with env-resolved key
-      python abstract-screening.py papers.csv results.csv --provider router
-
-      # Using Groq with explicit key
-      python abstract-screening.py papers.csv results.csv --provider speed --api-key gsk_...
-
-      # Using custom endpoint
-      python abstract-screening.py papers.csv results.csv --base-url https://my-llm.example.com/v1 --api-key sk_...
-
-    ENVIRONMENT VARIABLES (for key resolution):
-      LLM_API_KEY: Generic API key (checked first)
-      LLM_KEY: Alternative generic API key
-      LLM_ROUTER_API_KEY, OPENROUTER_API_KEY: OpenRouter keys
-      LLM_SPEED_API_KEY, GROQ_API_KEY: Groq keys
-      LLM_CLOUD_API_KEY, TOGETHER_API_KEY: Together AI keys
-      LLM_BASE_URL: Alternative to --base-url CLI argument
     """
-    # Create argument parser
     parser = argparse.ArgumentParser(
         description="Screen scientific abstracts using an LLM API"
     )
+    # OpenRouter-Modelle brauchen typischerweise den Provider-Prefix.
     parser.add_argument("input_csv", help="Path to input CSV (must have 'doi', 'abstract' columns)")
     parser.add_argument("output_csv", help="Path to output CSV (will be created)")
     parser.add_argument(
         "--model",
-        default="gpt-4o-mini",
-        help="Model identifier (default: gpt-4o-mini)",
+        default="openai/gpt-4o-mini",
+        help="Model identifier (OpenRouter-style, e.g. openai/gpt-4o-mini)",
     )
     parser.add_argument(
         "--provider",
