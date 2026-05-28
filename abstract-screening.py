@@ -10,6 +10,7 @@ import csv
 import time
 import urllib.request
 import urllib.error
+import sys
 
 """
 AUTOMATED ABSTRACT SCREENING PIPELINE FOR CLIMATE NEUTRALITY REVIEW
@@ -319,16 +320,28 @@ def call_llm_once(client: LLMApiClient, model: str, abstract: str) -> Dict[str, 
         ],
     )
 
-    # Extract the JSON content from the API response
-    # Response structure: {"choices": [{"message": {"content": "..."}}], ...}
     content = (
         (response.get("choices") or [{}])[0]
         .get("message", {})
         .get("content")
     ) or "{}"
 
-    parsed = json.loads(content)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise
+
     return normalize_result(parsed)
+
+# ============================================================================
+# DEBUG LOGGING (optional, controlled via env var)
+# ============================================================================
+def _debug_log(message: str) -> None:
+    """
+    Ausgabe von Debug-Infos nur wenn LLM_DEBUG=1 gesetzt ist.
+    """
+    if os.environ.get("LLM_DEBUG") == "1":
+        print(f"[DEBUG] {message}", file=sys.stderr)
 
 # ============================================================================
 # CONFIGURATION RESOLUTION FUNCTIONS
@@ -496,8 +509,9 @@ def process_csv(
         output_csv, "w", encoding="utf-8", newline=""
     ) as fout:
         # Create CSV reader/writer
-        reader = csv.DictReader(fin)
+        reader = csv.DictReader(fin, delimiter=";")
         writer = csv.DictWriter(fout, fieldnames=RESULT_COLUMNS)
+
 
         # Write output header
         writer.writeheader()
@@ -512,16 +526,18 @@ def process_csv(
                 # Call LLM for this abstract
                 screened = call_llm_once(client, model, abstract)
             except Exception as exc:
-                # If LLM call fails, mark entire paper as "unclear" with error type
+                # Konkrete Fehlermeldung sichtbar machen (statt nur "RuntimeError")
+                err_msg = _short_error(exc)
+                _debug_log(f"LLM failed: {err_msg}")
                 screened = {
                     "q1_climate_neutrality": "unclear",
-                    "q1_comment": f"llm error: {type(exc).__name__}",
+                    "q1_comment": f"llm error: {err_msg}",
                     "q2_region": "unclear",
-                    "q2_comment": f"llm error: {type(exc).__name__}",
+                    "q2_comment": f"llm error: {err_msg}",
                     "q3_sector": "unclear",
-                    "q3_comment": f"llm error: {type(exc).__name__}",
+                    "q3_comment": f"llm error: {err_msg}",
                     "q4_method": "unclear",
-                    "q4_comment": f"llm error: {type(exc).__name__}",
+                    "q4_comment": f"llm error: {err_msg}",
                 }
 
             # Write result row to output CSV
@@ -538,6 +554,16 @@ def process_csv(
                     "q4_comment": screened["q4_comment"],
                 }
             )
+
+# ============================================================================
+# ERROR HELPERS
+# ============================================================================
+def _short_error(exc: Exception, max_len: int = 200) -> str:
+    """
+    Kürzt Fehlermeldungen für CSV-Ausgabe, damit sie lesbar bleiben.
+    """
+    msg = f"{type(exc).__name__}: {exc}"
+    return (msg[:max_len] + "...") if len(msg) > max_len else msg
 
 # ============================================================================
 # ENTRY POINT
