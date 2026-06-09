@@ -8,7 +8,7 @@ from collections import defaultdict
 # ============================================================================
 
 # Pfade zu den Input-CSVs
-LLM_RESULTS_CSV = "output_20260529_openai_gpt4o-mini.csv"
+LLM_RESULTS_CSV = "abstracts_output_githubcopilot_202605.csv"
 CADIMA_INCLUDED_CSV = "included_abstract_cadima.csv"
 CADIMA_EXCLUDED_CSV = "excluded_abstract_cadima.csv"
 
