@@ -8,9 +8,9 @@ from collections import defaultdict
 # ============================================================================
 
 # Pfade zu den Input-CSVs
-LLM_RESULTS_CSV = "abstracts_output_githubcopilot_202605.csv"
-CADIMA_INCLUDED_CSV = "included_abstract_cadima.csv"
-CADIMA_EXCLUDED_CSV = "excluded_abstract_cadima.csv"
+LLM_RESULTS_CSV = "outputs_llm_runs/abstracts_output_githubcopilot_202605.csv"
+CADIMA_INCLUDED_CSV = "abstract_stage_cadima_outputs/included_abstract_cadima.csv"
+CADIMA_EXCLUDED_CSV = "abstract_stage_cadima_outputs/excluded_abstract_cadima.csv"
 
 # Output-Verzeichnis (gleich wie Input)
 OUTPUT_DIR = Path(".")
@@ -201,10 +201,12 @@ def load_llm_data():
         q3 = (row.get("q3_sector") or "").strip().lower()
         q4 = (row.get("q4_method") or "").strip().lower()
 
-        if q1 == "yes" and q2 == "yes" and q3 == "yes" and q4 == "yes":
-            llm_data[doi] = "included"
-        else:
+        answers = [q1, q2, q3, q4]
+
+        if "no" in answers:
             llm_data[doi] = "excluded"
+        else:
+            llm_data[doi] = "included"
 
     print(f"✅ LLM geladen: {len(llm_data)} papers")
     return llm_data
