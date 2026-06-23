@@ -7,10 +7,14 @@ from collections import defaultdict
 # CONFIGURATION
 # ============================================================================
 
-# Pfade zu den Input-CSVs
-LLM_RESULTS_CSV = "outputs_llm_runs/abstracts_output_githubcopilot_202605.csv"
-CADIMA_INCLUDED_CSV = "abstract_stage_cadima_outputs/included_abstract_cadima.csv"
-CADIMA_EXCLUDED_CSV = "abstract_stage_cadima_outputs/excluded_abstract_cadima.csv"
+# HIER ANPASSEN
+LLM_RUN_OUTPUT = "output_api_claude-4.6-sonnet_20260622"
+CADIMA_STAGE = "after_fulltext" # after_abstract or after_fulltext
+
+
+LLM_RESULTS_CSV = f"outputs_llm_runs_abstract_screening/{LLM_RUN_OUTPUT}.csv"
+CADIMA_INCLUDED_CSV = f"cadima_outputs/included_{CADIMA_STAGE}.csv"
+CADIMA_EXCLUDED_CSV = f"cadima_outputs/excluded_{CADIMA_STAGE}.csv"
 
 # Output-Verzeichnis (gleich wie Input)
 OUTPUT_DIR = Path(".")
@@ -319,7 +323,7 @@ def main():
             "dois_only_llm": sorted(list(only_llm)),
             "dois_only_cadima": sorted(list(only_cadima)),
         }
-        save_json("overlap_info.json", overlap_info)
+        save_json(f"analyses_llm_vs_cadima/{CADIMA_STAGE}/{LLM_RUN_OUTPUT}/overlap_info.json", overlap_info)
 
         # Kategorisierung (nur overlapping)
         categories = categorize_overlapping(cadima_data, llm_data, both)
@@ -337,7 +341,7 @@ def main():
                 "only_cadima_relevant_count": len(categories["only_cadima_relevant"]),
             }
         }
-        save_json("comparison_categories.json", categories_info)
+        save_json(f"analyses_llm_vs_cadima/{CADIMA_STAGE}/{LLM_RUN_OUTPUT}/comparison_categories.json", categories_info)
 
         print("\n" + "=" * 70)
         print("✅ FERTIG!")

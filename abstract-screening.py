@@ -324,7 +324,24 @@ def call_llm_once(client: LLMApiClient, model: str, abstract: str) -> Dict[str, 
         (response.get("choices") or [{}])[0]
         .get("message", {})
         .get("content")
-    ) or "{}"
+    )
+
+    if not content:
+        raise RuntimeError(f"Empty response: {response}")
+
+    content = content.strip()
+
+    # JSON extrahieren (fallback falls Claude Text davor schreibt)
+    if not content.startswith("{"):
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1:
+            content = content[start:end + 1]
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Invalid JSON from model: {content}")
 
     try:
         parsed = json.loads(content)
